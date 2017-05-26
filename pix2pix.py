@@ -20,6 +20,7 @@ parser.add_argument("--output_dir", required=True, help="where to put output fil
 parser.add_argument("--seed", type=int)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
 
+parser.add_argument("--max_examples", type=int, help="number of training steps (0 to disable)")
 parser.add_argument("--max_steps", type=int, help="number of training steps (0 to disable)")
 parser.add_argument("--max_epochs", type=int, help="number of training epochs")
 parser.add_argument("--summary_freq", type=int, default=100, help="update summaries every summary_freq steps")
@@ -28,14 +29,15 @@ parser.add_argument("--trace_freq", type=int, default=0, help="trace execution e
 parser.add_argument("--display_freq", type=int, default=0, help="write current training images every display_freq steps")
 parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
 
-parser.add_argument("--batch_size", type=int, default=64, help="number of images in batch")
+parser.add_argument("--batch_size", type=int, default=128, help="number of images in batch")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
 parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
-parser.add_argument("--lr", type=float, default=0.0002, help="initial learning rate for adam")
+parser.add_argument("--lr", type=float, default=0.001, help="initial learning rate for adam")
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
 parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
-parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
+parser.add_argument("--gan_weight", type=float, default=0.2, help="weight on GAN term for generator gradient")
+parser.add_argument("--dropout", type=float, default=0.5, help="dropout rate")
 
 # export options
 parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
@@ -59,15 +61,32 @@ def deprocess(image):
         return (image + 1) / 2
 
 
-def conv(batch_input, out_channels, stride):
+def conv(batch_input, out_channels, stride, filter_size = 4):
     with tf.variable_scope("conv"):
         in_channels = batch_input.get_shape()[3]
-        filter = tf.get_variable("filter", [4, 4, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        filter = tf.get_variable("filter", [filter_size, filter_size, in_channels, out_channels], dtype=tf.float32, initializer=tf.truncated_normal_initializer(0, 0.02))
         # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
         #     => [batch, out_height, out_width, out_channels]
-        padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
-        conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
+        conv = tf.nn.conv2d(batch_input, filter, [1, stride, stride, 1], padding="SAME")
         return conv
+
+
+
+def highway_conv(batch_input, out_channels, stride, filter_size = 4):
+    with tf.variable_scope("highway_conv"):
+        in_channels = batch_input.get_shape()[3]
+        W = tf.get_variable("W", [filter_size, filter_size, in_channels, out_channels], dtype=tf.float32, initializer=tf.truncated_normal_initializer(0, 0.02))
+        W_T = tf.get_variable("W_T", [filter_size, filter_size, in_channels, out_channels], dtype=tf.float32, initializer=tf.truncated_normal_initializer(0, 0.02))
+        b = tf.get_variable("b", [out_channels], dtype=tf.float32, initializer=tf.constant_initializer(0.01))
+        b_T = tf.get_variable("b_T", [out_channels], dtype=tf.float32, initializer=tf.constant_initializer(0.01))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        conv = tf.nn.conv2d(batch_input, W, [1, stride, stride, 1], padding="SAME")
+        
+        H = tf.nn.relu(tf.nn.conv2d(batch_input, W, [1, stride, stride, 1], padding="SAME") + b, name='activation')
+        T = tf.sigmoid(tf.nn.conv2d(batch_input, W_T, [1, stride, stride, 1], padding="SAME") + b_T, name='transform_gate')
+        C = tf.subtract(1.0, T, name="carry_gate")
+        return tf.add(tf.multiply(H, T), tf.multiply(batch_input, C), 'batch_output') # y = (H * T) + (x * C)
 
 
 def lrelu(x, a):
@@ -89,20 +108,22 @@ def batchnorm(input):
 
         channels = input.get_shape()[3]
         offset = tf.get_variable("offset", [channels], dtype=tf.float32, initializer=tf.zeros_initializer())
-        scale = tf.get_variable("scale", [channels], dtype=tf.float32, initializer=tf.random_normal_initializer(1.0, 0.02))
+        scale = tf.get_variable("scale", [channels], dtype=tf.float32, initializer=tf.truncated_normal_initializer(1.0, 0.02))
         mean, variance = tf.nn.moments(input, axes=[0, 1, 2], keep_dims=False)
         variance_epsilon = 1e-5
         normalized = tf.nn.batch_normalization(input, mean, variance, offset, scale, variance_epsilon=variance_epsilon)
         return normalized
 
 
-def deconv(batch_input, out_channels):
+
+
+def deconv(batch_input, out_channels, stride = 2, filter_size = 4):
     with tf.variable_scope("deconv"):
         batch, in_height, in_width, in_channels = [int(d) for d in batch_input.get_shape()]
-        filter = tf.get_variable("filter", [4, 4, out_channels, in_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        filter = tf.get_variable("filter", [filter_size, filter_size, out_channels, in_channels], dtype=tf.float32, initializer=tf.truncated_normal_initializer(0, 0.02))
         # [batch, in_height, in_width, in_channels], [filter_width, filter_height, out_channels, in_channels]
         #     => [batch, out_height, out_width, out_channels]
-        conv = tf.nn.conv2d_transpose(batch_input, filter, [batch, in_height * 2, in_width * 2, out_channels], [1, 2, 2, 1], padding="SAME")
+        conv = tf.nn.conv2d_transpose(batch_input, filter, [batch, in_height * stride, in_width * stride, out_channels], [1, stride, stride, 1], padding="SAME")
         return conv
 
 
@@ -134,7 +155,12 @@ def load_examples():
 
     if len(input_paths) == 0:
         raise Exception("input_dir contains no image files")
+    
+    if a.max_examples and len(input_paths) > a.max_examples:        
+        input_paths = input_paths[:a.max_examples]
+        
 
+    
     def get_name(path):
         name, _ = os.path.splitext(os.path.basename(path))
         return name
@@ -155,10 +181,10 @@ def load_examples():
         raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
         # raw_input = tf.image.crop_to_bounding_box(raw_input, [200, 1280, 1]) 
 
-        assertion = tf.assert_equal(tf.shape(raw_input)[0], 256, message="image does not have heigth 256")
-        assertion = tf.assert_equal(tf.shape(raw_input)[1], 512, message="image does not have width 512")
-        assertion = tf.assert_equal(tf.shape(raw_input)[2], 1, message="image does not have 1 channels")
-        with tf.control_dependencies([assertion]):
+        assertion1 = tf.assert_equal(tf.shape(raw_input)[0], 256, message="image does not have heigth 256")
+        assertion2 = tf.assert_equal(tf.shape(raw_input)[1], 512, message="image does not have width 512")
+        assertion3 = tf.assert_equal(tf.shape(raw_input)[2], 1, message="image does not have 1 channels")
+        with tf.control_dependencies([assertion1, assertion2, assertion3]):
             raw_input = tf.identity(raw_input)
 
         
@@ -193,13 +219,11 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
-        output = conv(generator_inputs, a.ngf, stride=2)
+        output = conv(generator_inputs, a.ngf * 4, stride=8, filter_size=8)
         layers.append(output)
 
     layer_specs = [
-        a.ngf * 2, # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
-        a.ngf * 4, # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
-        a.ngf * 8, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
+        a.ngf * 4, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
         a.ngf * 8, # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
         a.ngf * 8, # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
         a.ngf * 8, # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
@@ -215,13 +239,11 @@ def create_generator(generator_inputs, generator_outputs_channels):
             layers.append(output)
 
     layer_specs = [
-        (a.ngf * 8, 0.5),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
+        (a.ngf * 8, a.dropout),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
+        (a.ngf * 8, a.dropout),   # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
+        (a.ngf * 8, a.dropout),   # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
         (a.ngf * 8, 0.0),   # decoder_5: [batch, 8, 8, ngf * 8 * 2] => [batch, 16, 16, ngf * 8 * 2]
         (a.ngf * 4, 0.0),   # decoder_4: [batch, 16, 16, ngf * 8 * 2] => [batch, 32, 32, ngf * 4 * 2]
-        (a.ngf * 2, 0.0),   # decoder_3: [batch, 32, 32, ngf * 4 * 2] => [batch, 64, 64, ngf * 2 * 2]
-        (a.ngf, 0.0),       # decoder_2: [batch, 64, 64, ngf * 2 * 2] => [batch, 128, 128, ngf * 2]
     ]
 
     num_encoder_layers = len(layers)
@@ -249,7 +271,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
     with tf.variable_scope("decoder_1"):
         input = tf.concat([layers[-1], layers[0]], axis=3)
         rectified = tf.nn.relu(input)
-        output = deconv(rectified, generator_outputs_channels)
+        output = deconv(rectified, generator_outputs_channels, stride=8, filter_size=8)
         output = tf.tanh(output)
         layers.append(output)
 
@@ -258,7 +280,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
 def create_model(inputs, targets):
     def create_discriminator(discrim_inputs, discrim_targets):
-        n_layers = 3
+        n_layers = 1
         layers = []
 
         # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
@@ -266,12 +288,10 @@ def create_model(inputs, targets):
 
         # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
         with tf.variable_scope("layer_1"):
-            convolved = conv(input, a.ndf, stride=2)
+            convolved = conv(input, a.ndf * 4, stride=8, filter_size=8)
             rectified = lrelu(convolved, 0.2)
             layers.append(rectified)
 
-        # layer_2: [batch, 128, 128, ndf] => [batch, 64, 64, ndf * 2]
-        # layer_3: [batch, 64, 64, ndf * 2] => [batch, 32, 32, ndf * 4]
         # layer_4: [batch, 32, 32, ndf * 4] => [batch, 31, 31, ndf * 8]
         for i in range(n_layers):
             with tf.variable_scope("layer_%d" % (len(layers) + 1)):
@@ -481,6 +501,7 @@ def main():
 
     examples = load_examples()
     print("examples count = %d" % examples.count)
+        
 
     # inputs and targets are [batch_size, height, width, channels]
     model = create_model(examples.inputs, examples.targets)
